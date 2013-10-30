@@ -1,0 +1,2210 @@
+diff -rupN org2/apache/giraph/bsp/CentralizedServiceWorker.java org/apache/giraph/bsp/CentralizedServiceWorker.java
+--- org2/apache/giraph/bsp/CentralizedServiceWorker.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/bsp/CentralizedServiceWorker.java	2013-09-18 00:53:49.174502791 -0400
+@@ -45,6 +45,13 @@ public interface CentralizedServiceWorke
+         E extends Writable,
+         M extends Writable>
+         extends CentralizedService<I, V, E, M>, AggregatorUsage {
++	
++	
++    //**************************** SEREF-START ********************************//
++	void prepareVertexMap();  // Prepare a map which holds <vertexID, vertexPointer> pairs
++	Map<I,BasicVertex<I,V,E,M>> getVertexMap(); // just return the map
++    //**************************** SEREF-END ********************************//
++
+     /**
+      * Get the worker information
+      *
+diff -rupN org2/apache/giraph/comm/BasicRPCCommunications.java org/apache/giraph/comm/BasicRPCCommunications.java
+--- org2/apache/giraph/comm/BasicRPCCommunications.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/comm/BasicRPCCommunications.java	2013-09-18 18:51:01.192308462 -0400
+@@ -28,6 +28,8 @@ import org.apache.giraph.graph.VertexCom
+ import org.apache.giraph.graph.VertexMutations;
+ import org.apache.giraph.graph.VertexResolver;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.io.IntWritable;
++import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+ import org.apache.hadoop.ipc.RPC;
+@@ -59,6 +61,7 @@ import org.apache.giraph.graph.WorkerInf
+ import org.apache.giraph.graph.partition.Partition;
+ import org.apache.giraph.graph.partition.PartitionOwner;
+ import org.apache.giraph.utils.MemoryUtils;
++import org.mortbay.log.Log;
+ 
+ import com.google.common.collect.Iterables;
+ 
+@@ -97,6 +100,13 @@ public abstract class BasicRPCCommunicat
+     private long totalMsgsSentInSuperstep = 0;
+     /** Maximum messages sent per putVertexIdMessagesList RPC */
+     private final int maxMessagesPerFlushPut;
++    
++    //**************************** SEREF-START ********************************//
++    public CentralizedServiceWorker<I, V, E, M> getServiceWorker(){
++    	return service;
++    }
++    //**************************** SEREF-END ********************************//
++
+     /**
+      * Map of the peer connections, mapping from remote socket address to client
+      * meta data
+@@ -201,6 +211,13 @@ public abstract class BasicRPCCommunicat
+             return peer.getName() + ", proxy=" + isProxy;
+         }
+     }
++    
++    public void incrementTotalMessagesSent(int count){
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getServiceWorker().getGraphMapper().getGraphState().getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Total messages sent after combined").increment(count);
++    }
+ 
+     private class PeerFlushExecutor implements Runnable {
+         private final PeerConnection peerConnection;
+@@ -255,6 +272,7 @@ public abstract class BasicRPCCommunicat
+                             for (M msg: messages) {
+                                 entry.getValue().add(msg);
+                             }
++                            incrementTotalMessagesSent(Iterables.size(messages));
+                         }
+                         if (entry.getValue().isEmpty()) {
+                             throw new IllegalStateException(
+diff -rupN org2/apache/giraph/comm/WorkerCommunications.java org/apache/giraph/comm/WorkerCommunications.java
+--- org2/apache/giraph/comm/WorkerCommunications.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/comm/WorkerCommunications.java	2013-09-18 18:54:22.433306363 -0400
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.giraph.comm;
+ 
++import org.apache.giraph.bsp.CentralizedServiceWorker;
+ import org.apache.giraph.graph.BasicVertex;
+ import org.apache.giraph.graph.Edge;
+ import org.apache.giraph.graph.WorkerInfo;
+@@ -27,6 +28,7 @@ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+ 
+ import java.io.IOException;
++import java.net.InetSocketAddress;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -43,6 +45,12 @@ public interface WorkerCommunications<I
+                                       V extends Writable,
+                                       E extends Writable,
+                                       M extends Writable> {
++	
++	
++    //**************************** SEREF-START ********************************//
++	CentralizedServiceWorker<I, V, E, M> getServiceWorker();
++    //**************************** SEREF-END ********************************//
++
+     /**
+      * Fix changes to the workers and the mapping between partitions and
+      * workers.
+diff -rupN org2/apache/giraph/examples/DiningColoringCombiner.java org/apache/giraph/examples/DiningColoringCombiner.java
+--- org2/apache/giraph/examples/DiningColoringCombiner.java	1969-12-31 19:00:00.000000000 -0500
++++ org/apache/giraph/examples/DiningColoringCombiner.java	2013-07-25 02:29:23.748716000 -0400
+@@ -0,0 +1,77 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++package org.apache.giraph.examples;
++
++import org.apache.giraph.graph.VertexCombiner;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * {@link VertexCombiner} that finds the sum of messages in {@link Text} format
++ */
++public class DiningColoringCombiner
++        extends VertexCombiner<LongWritable, Text> {
++
++    @Override
++    public Iterable<Text> combine(LongWritable target,
++    		Iterable<Text> messages) throws IOException {
++    	
++    	List<Text> value = new ArrayList<Text>();
++    	String msgType;
++    	String m2="M2:"; boolean isM2 = false;
++    	String m3="M3:"; boolean isM3 = false;
++    	String m4="M4:"; boolean isM4 = false;
++    	
++    	for (Text message : messages) {
++    		msgType = message.toString().split(":")[0];
++    		if(msgType.equals("M1")){
++    			value.add(message);
++    		}
++    		else if(msgType.equals("M2")){
++    			isM2 = true;
++    			m2=m2+message.toString().split(":")[1]+"_";
++    		}
++    		else if(msgType.equals("M3")){
++    			isM3 = true;
++    			m3=m3+message.toString().split(":")[1]+"_";
++    		}
++    		else if(msgType.equals("M4")){
++    			isM4 = true;
++    			m4=m4+message.toString().split(":")[1]+"_";
++    		}
++    		else{
++    			value.add(message);
++    		}
++        }
++    	m2 = m2.substring(0, m2.length() - 1);
++    	if(isM2){ value.add(new Text(m2)); }
++    	
++    	m3 = m3.substring(0, m3.length() - 1);
++    	if(isM3){ value.add(new Text(m3)); }
++    	
++    	m4 = m4.substring(0, m4.length() - 1);
++    	if(isM4){ value.add(new Text(m4)); }
++    			
++        return value;
++    }
++}
+diff -rupN org2/apache/giraph/examples/Giraphx.java org/apache/giraph/examples/Giraphx.java
+--- org2/apache/giraph/examples/Giraphx.java	1969-12-31 19:00:00.000000000 -0500
++++ org/apache/giraph/examples/Giraphx.java	2013-09-19 10:31:25.727768190 -0400
+@@ -0,0 +1,979 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.giraph.examples;
++
++import com.google.common.base.Preconditions;
++import com.google.common.collect.Maps;
++
++import org.apache.commons.lang.mutable.MutableInt;
++import org.apache.giraph.graph.BasicVertex;
++import org.apache.giraph.graph.BspUtils;
++import org.apache.giraph.graph.GiraphJob;
++import org.apache.giraph.graph.EdgeListVertex;
++import org.apache.giraph.graph.VertexCombiner;
++import org.apache.giraph.graph.VertexReader;
++import org.apache.giraph.graph.VertexWriter;
++import org.apache.giraph.graph.WorkerContext;
++import org.apache.giraph.lib.TextVertexInputFormat;
++import org.apache.giraph.lib.TextVertexInputFormat.TextVertexReader;
++import org.apache.giraph.lib.TextVertexOutputFormat;
++import org.apache.giraph.lib.TextVertexOutputFormat.TextVertexWriter;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.filecache.DistributedCache;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.DoubleWritable;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapreduce.InputSplit;
++import org.apache.hadoop.mapreduce.RecordReader;
++import org.apache.hadoop.mapreduce.RecordWriter;
++import org.apache.hadoop.mapreduce.TaskAttemptContext;
++import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
++import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
++import org.apache.hadoop.util.Tool;
++import org.apache.hadoop.util.ToolRunner;
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.mortbay.log.Log;
++
++import java.io.IOException;
++import java.net.URI;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Map.Entry;
++
++/**
++ * Demonstrates the basic Pregel shortest paths implementation.
++ */
++public class Giraphx extends
++        EdgeListVertex<LongWritable, Text,
++        Text, Text> implements Tool {
++    
++
++	/** Configuration */
++    private Configuration conf;
++    /** The shortest paths id */
++    public static String SOURCE_ID = "Giraphx.sourceId";
++    /** Default shortest paths id */
++    public static long SOURCE_ID_DEFAULT = 1;
++    
++    public static int MAX_SUPERSTEPS_DEFAULT = 90;
++    public static String MAX_SUPERSTEPS_CONF = "Giraphx.maxSupersteps";
++    public static String VERSION_OF_JOB_DEFAULT = "empty";
++    public static String VERSION_OF_JOB_CONF = "Giraphx.versionOfJob";
++    public static String NUM_VERTICES_CONF = "giraph.numVertices";
++	public static String PARTITIONER_TYPE = "giraph.partitionerType";
++
++	
++    public int MAX_SUPERSTEPS = MAX_SUPERSTEPS_DEFAULT;
++    public String VERSION_OF_JOB = VERSION_OF_JOB_DEFAULT;
++    public int NUM_VERTICES = -1;
++
++
++	private int colorsLength;
++	private boolean available[];
++	
++	private static double tolerance = 0.000000001;  // Used for pageRank termination condition
++	
++	boolean ovcFlag=false;
++	private boolean token=false;
++
++    private List<LongWritable> incomingEdgeIndexList = new ArrayList<LongWritable>();
++	private Map<Long,String> myForkMap = new HashMap<Long,String>();
++	private List<Long> inReqList = new ArrayList<Long>();
++	private List<LongWritable> allEdgeIndexList = new ArrayList<LongWritable>();
++
++	private int nonlocalNeighborCount=0;
++	private Map<LongWritable,Boolean> isLocalMap = new HashMap<LongWritable,Boolean>();
++	private Map<LongWritable,Boolean> outReqMap = new HashMap<LongWritable,Boolean>();
++	private Map<Long,String> msgListMainMap = new HashMap<Long,String>();
++	private Map<LongWritable, Text> vertexValues = new HashMap<LongWritable, Text>();
++	
++	private List<Long> fakeIdList  = new ArrayList<Long>();
++	long fakeId;
++	int length;
++	MutableInt lastUpdateSuperstep;
++
++
++	@Override  
++    public void compute(Iterator<Text> msgIterator) {
++		this.token = WorkerContext.token;  // This will be used for tGiraphx
++		//Log.info("SEREF: Token is: " + token);
++
++		if(getSuperstep()==0){  // Initialize configuration parameters
++    		MAX_SUPERSTEPS = getContext().getConfiguration().getInt(MAX_SUPERSTEPS_CONF,
++    				MAX_SUPERSTEPS_DEFAULT);
++    		NUM_VERTICES = getContext().getConfiguration().getInt(NUM_VERTICES_CONF,
++    				-1);
++    		VERSION_OF_JOB = getContext().getConfiguration().get(VERSION_OF_JOB_CONF,
++    	    		VERSION_OF_JOB_DEFAULT);
++    		length = String.valueOf(NUM_VERTICES).length();
++		}
++		
++		if(VERSION_OF_JOB.contains("dGiraph")){
++			compute_dGiraph(msgIterator);
++		}
++		else if(VERSION_OF_JOB.equals("tGiraphx_coloring")){
++			compute_tGiraphx_coloring(msgIterator,token);
++		}
++		else if(VERSION_OF_JOB.equals("orig_pagerank")){
++			compute_original_pagerank(msgIterator);
++		}
++		else if(VERSION_OF_JOB.equals("giraphx_pagerank")){
++			compute_giraphx_pagerank(msgIterator);
++		}
++		else{
++			Log.info("SEREF:\t ERROR:INVALID JOB TYPE: "+VERSION_OF_JOB);
++			voteToHalt();
++		}
++    }
++	
++	public void compute_original_pagerank(Iterator<Text> msgIterator) {
++		// Get the number of vertices that have a change in pagerank greater than tolerance
++		LongSumAggregator prsumAggreg = (LongSumAggregator) getAggregator("prsum");    	
++    	long prDiffSum = -1;
++    	if(getSuperstep() > 1){
++    		prDiffSum = GiraphxWorkerContext.prDifferenceSum;
++    		if(getVertexId().get() == 0){
++    			Log.info("SEREF Pagerank difference is: " + prDiffSum);
++    		}
++    	}
++    	
++    	// Halt if max superstep is reached or no vertex has a significant value change
++        if (getSuperstep() > MAX_SUPERSTEPS || prDiffSum == 0) {
++        	voteToHalt();
++        	return;
++        }
++
++		if(getSuperstep()==0){  // Init pageRank value at ss=0
++			needsOperation = false;
++			double init = 1.0f;// / (double)NUM_VERTICES;
++			//tolerance = init / 100.0;
++			setVertexValue(new Text(init+""));
++		}
++		
++        if (getSuperstep() >= 1) {
++            double sum = 0;
++            while (msgIterator.hasNext()) {
++                sum += Double.parseDouble(msgIterator.next().toString());
++            }
++            DoubleWritable vertexValue =
++                new DoubleWritable((0.15f / getNumVertices()) + 0.85f * sum);
++            double diff = Math.abs(	Double.parseDouble(getVertexValue().toString()) 
++            		- Double.parseDouble(vertexValue.toString()) );
++//            Log.info("SEREF: Old and new pagerank values are: " + getVertexValue() +" -> " + vertexValue);
++            
++            if(diff>tolerance){
++            	prsumAggreg.aggregate(1);
++            }
++            setVertexValue(new Text(vertexValue.toString()));
++       }
++
++        if (getSuperstep() < MAX_SUPERSTEPS && prDiffSum != 0) {
++            sendMsgToAllEdges(
++                new Text((Double.parseDouble(getVertexValue().toString()) 
++                		/ getNumOutEdges())+""));
++        } 
++    }
++
++	private void compute_giraphx_pagerank(Iterator<Text> msgIterator) {
++		// Get the number of vertices that have a change in pagerank greater than tolerance
++		LongSumAggregator prsumAggreg = (LongSumAggregator) getAggregator("prsum");    	
++    	long prDiffSum = -1;
++    	if(getSuperstep() > 1){
++    		prDiffSum = GiraphxWorkerContext.prDifferenceSum;
++    		if(getVertexId().get() == 0){
++    			Log.info("SEREF Pagerank difference is: " + prDiffSum);
++    		}
++    	}
++
++        if (getSuperstep() > MAX_SUPERSTEPS || prDiffSum == 0) {
++            voteToHalt();
++    		vertexValues.clear();
++            return;
++        }
++        
++		if(getSuperstep()==0){
++			needsOperation = false;
++			double init = 1.0f;// / (double)NUM_VERTICES;
++			//tolerance = init / 100.0;
++			setVertexValue(new Text(init+""));
++			
++        	destEdgeIndexList.remove(getVertexId());
++            Text value =
++                    new Text((Double.parseDouble(getVertexValue().toString()) 
++                    		/ getNumOutEdges())+"");
++
++    		sendMsgToAllEdges(new Text("M1:"+getVertexId()+":"+value));
++    		return;
++    	}  
++ 
++        double diff=-1;
++        
++        if (getSuperstep() >= 1) {
++            double sum = 0;
++            while (msgIterator.hasNext()) {  // in this loop nonlocal neighbor pagerank values are read
++            	String tmp=msgIterator.next().toString();
++            	long id = Long.parseLong(tmp.split(":")[1]);
++        		double val = Double.parseDouble(tmp.split(":")[2]);
++                vertexValues.put(new LongWritable(id), new Text(val+""));
++                if(getSuperstep()==1){
++                	incomingEdgeIndexList.add(new LongWritable(id));
++                }
++            }
++            if(getSuperstep()==1){
++            	incomingEdgeIndexList.remove(getVertexId());
++            }else{
++            	readPagerankFromNeighbors(vertexValues,incomingEdgeIndexList);
++            }
++            Iterator<Entry<LongWritable, Text>> vit = vertexValues.entrySet().iterator();
++         	while(vit.hasNext()){
++         		Entry<LongWritable, Text> e = vit.next();
++         		double value = Double.parseDouble(e.getValue().toString());
++         		sum += value;
++         	}	
++            DoubleWritable vertexValue =
++                new DoubleWritable((0.15f / getNumVertices()) + 0.85f * sum);
++            diff = Math.abs(	Double.parseDouble(getVertexValue().toString()) 
++            		- Double.parseDouble(vertexValue.toString()) );
++            if(diff>tolerance){
++            	prsumAggreg.aggregate(1);
++                setVertexValue(new Text(vertexValue.toString()));
++            }
++       }
++       
++        if (getSuperstep() < MAX_SUPERSTEPS && diff > tolerance) {
++            long edges = getNumOutEdges();
++            String vval = (Double.parseDouble(getVertexValue().toString()) / edges)+"";
++            String msg = "M1:"+getVertexId()+":"+vval;
++            sendMsgToDistantEdges(new Text(msg), destEdgeIndexList);
++        }
++        needsOperation = false;
++        voteToHalt();
++        
++	}
++
++	private void compute_tGiraphx_coloring(Iterator<Text> msgIterator,
++			boolean token2) {
++		
++        if (getSuperstep() > MAX_SUPERSTEPS) {   
++            voteToHalt();
++    		vertexValues.clear();
++    		available=null;
++    		needsOperation = false;
++            return;
++        }
++		
++        MaxAggregator maxAggreg = (MaxAggregator) getAggregator("max");
++    	
++    	//Log.info("SEREF Vertex "+getVertexId()+" started at superstep "+getSuperstep());
++        if(getSuperstep()==0){  // So that each vertex also learns its incoming edge IDs
++        	destEdgeIndexList.remove(getVertexId());
++    		sendMsgToAllEdges(new Text("M1:"+getVertexId()+":"+getVertexValue()));
++    		return;
++    	}  
++        
++    	Iterator<Text> it = msgIterator;
++    	while (it.hasNext()) {
++    		String tmp=it.next().toString();
++    		//Log.info("SEREF Incoming Message is:\t"+tmp);
++    		long neighbor_id = Long.parseLong(tmp.split(":")[1]);
++    		
++    		if(getSuperstep()==1){
++    			incomingEdgeIndexList.add(new LongWritable(neighbor_id));
++    		}
++    		else{
++    			needsOperation = true;
++    			msgListMainMap.put(neighbor_id, tmp);
++    		}
++    	}
++        
++		//Log.info("SEREF msgListMainMap size is:\t"+msgListMainMap.size());
++        if(getSuperstep()==1){  // initialize all edges list at superstep 1
++        	incomingEdgeIndexList.remove(getVertexId());
++        	initAllEdgeIndexList();        	
++        	isInternal = checkIsInternal(allEdgeIndexList);
++			if(isInternal){
++    			getContext().getCounter("Giraph Stats", "Local vertex count").increment(1);
++			}
++        	sendMsgToDistantEdges(new Text("M1:"+getVertexId()+":"+getVertexValue()), allEdgeIndexList);
++        	maxAggreg.aggregate(new DoubleWritable(allEdgeIndexList.size()));
++        	return;
++        }
++        
++        if(getSuperstep()==2){
++        	int degree = (int) GiraphxWorkerContext.maxDegree;
++        	colorsLength = 2*degree+5;
++        }
++
++        //Log.info("SEREF isInternal and token values Message is:\t"+isInternal+"\t"+token);    
++    	boolean isUpdated=false;    	
++        if(isInternal || (!isInternal && token) ){
++        	isUpdated=operate_tGiraph_coloring(msgListMainMap);
++        }
++           	
++    	if(isUpdated){
++        	String msg = "M1:"+getVertexId()+":"+getVertexValue().toString();
++        	//Log.info("SEREF sent message "+msg);
++        	sendMsgToDistantEdges(new Text(msg), allEdgeIndexList);
++    	}
++    	
++		available=null;   	    
++        voteToHalt();
++	}
++		
++    public void compute_dGiraph(Iterator<Text> msgIterator) {  
++    	
++        if (getSuperstep() == MAX_SUPERSTEPS) {   
++            voteToHalt();
++            vertexValues.clear();
++    		available=null;
++    		needsOperation = false;
++            return;
++        }
++        
++        MaxAggregator maxAggreg = (MaxAggregator) getAggregator("max");  
++        
++        long my_id = getVertexId().get();
++    	
++
++    	//Log.info("---- SEREF Vertex "+getVertexId()+" started at superstep "+getSuperstep()+" ----");
++    	if(getSuperstep()==0){  // So that each vertex also learns its incoming edge IDs
++    		destEdgeIndexList.remove(getVertexId());
++    		sendMsgToAllEdges(new Text("M1:"+getVertexId()+":"+getVertexValue()));
++    		return;
++    	}    
++    	    	    
++        // Split incoming messages: vertex value:M1, incoming fork:M2, fork request:M3, fakeID:M4
++    	splitIncomingMessages(msgIterator);
++		//Log.info("SEREF msgListMainMap size is:\t"+msgListMainMap.size());
++    	
++    	
++    	if(getSuperstep()==1){  // initialize all edges list at superstep 1
++    		incomingEdgeIndexList.remove(getVertexId());
++        	initAllEdgeIndexList();       
++        	//Log.info("SEREF allEdgeIndexList size is:\t"+allEdgeIndexList.size());
++        	
++	    	if(VERSION_OF_JOB.contains("Giraphx")){
++				isInternal = checkIsInternal(allEdgeIndexList);
++				if(isInternal){
++	    			getContext().getCounter( "Giraph Stats", "Internal vertex count").increment(1);
++				}
++			}
++			
++	    	int random = (int) (Math.random()*NUM_VERTICES);
++	    	fakeId = (long) (random * Math.pow(10, length) + getVertexId().get());
++	    	sendMsgToAllVersioned(new Text("M4:"+fakeId));
++        	//Log.info("SEREF sent the fake ID "+fakeId);
++
++        	Text msg=new Text("M1:"+getVertexId()+":"+getVertexValue());
++        	sendMsgToAllVersioned(msg);
++        	    	
++        	maxAggreg.aggregate(new DoubleWritable(allEdgeIndexList.size()));
++        	return;
++        }
++        
++        if(getSuperstep()==2){
++        	int maxDegree = (int) GiraphxWorkerContext.maxDegree;
++        	if(!isInternal){
++	        	isNeighborsLocal(isLocalMap,allEdgeIndexList);
++	    	}
++        	else{
++    			getContext().getCounter("Giraph Stats",
++                    "Local edge count").increment(allEdgeIndexList.size());
++			}
++        	initAvailableColors(maxDegree); 
++        	initForks(my_id);
++        	fakeIdList=null;
++        }
++
++    	//Log.info("SEREF nonlocalNeighborCount size is:\t"+nonlocalNeighborCount);
++    	//Log.info("SEREF myForkMap size is:\t"+myForkMap.size());
++    	
++    	boolean hasAllForks=false;
++    	boolean hasAllCleanOrNoRequest=false;
++    	if(myForkMap.size()==nonlocalNeighborCount && !isInternal){
++    		hasAllForks=true;
++    		hasAllCleanOrNoRequest=detectHasAllCleanOrNoRequest();
++    	}
++        //Log.info("SEREF hasAllForks and isInternal values Message is:\t"+hasAllForks+"\t"+isInternal);
++    	
++    	boolean isUpdated=false;    
++    	if(isInternal){  // only this block is used for a local vertex
++    		isUpdated=operateVersioned();
++    	}
++    	else if(hasAllForks && hasAllCleanOrNoRequest){
++    		isUpdated=operateVersioned();    		
++    		for(long key : myForkMap.keySet()){
++    			myForkMap.put(key, "DIRTY");
++    		}
++    		if(getSuperstep()==2){ //In ss=2 there is no incoming request, thus send forks immediately
++    			Text m2msg = new Text("M2:"+my_id);
++    			for (Long key : myForkMap.keySet()) {
++    				sendMsg(new LongWritable(key), m2msg);
++					//Log.info("SEREF sent message "+m2msg+" to "+key);
++    			}
++    			myForkMap.clear();
++    		}
++    	}
++
++    	if(isUpdated){
++        	String msg = "M1:"+getVertexId()+":"+getVertexValue().toString();
++        	//Log.info("SEREF sent message "+msg);
++        	sendMsgToAllVersioned(new Text(msg));
++    	}
++    	    
++    	if(!isInternal){
++        	handleForkRequestMessages(my_id);
++    	}
++    	
++    	hasAllForks=false;
++    	if(myForkMap.size()==nonlocalNeighborCount && !isInternal){
++    		hasAllForks=true;
++    	}
++    	if(!isInternal && !hasAllForks && needsOperation){
++        	requestMissingForks(my_id);
++    	}
++    	
++    	available=null;
++    	voteToHalt();
++        
++    	//haltIfAllNodesPassive(hasOperatedNew, isUpdated);
++    	
++        return;
++    }
++	
++	public boolean operate_dGiraph_max(Map<Long, String> msgListMainMap, boolean isPull) {
++    	Log.info("SEREF Vertex "+getVertexId()+" operates at superstep "+getSuperstep());
++    	long mymax = Long.parseLong(getVertexValue().toString());
++    	long oldmymax = Long.parseLong(getVertexValue().toString());
++		boolean isUpdated=false;
++
++		if(isPull){
++			readFromAllNeighbors(vertexValues,allEdgeIndexList);
++			iterateVertexValues(mymax, false);
++			//vertexValues.clear();
++		}	
++		iterateMessages(mymax, false);	
++    	setVertexValue(new Text(mymax+""));
++    	
++    	if(mymax!=oldmymax){
++			isUpdated=true;
++			Log.info("SEREF Vertex "+getVertexId()+" has updated to value\t"+mymax);
++		}
++    	
++        return isUpdated;
++    }    
++ 
++    public boolean operate_dGiraph_coloring(Map<Long, String> msgListMainMap, boolean isPull) {
++    	available = new boolean[colorsLength];
++    	Arrays.fill(available, true);
++    	
++		int oldVal=Integer.parseInt(getVertexValue().toString());
++		boolean isUpdated=false;
++    	
++		iterateMessages(-1, true);
++    	if(isPull){
++	    	readFromAllNeighbors(vertexValues, allEdgeIndexList);
++    	}
++    	iterateVertexValues(-1, true);
++    				
++			
++    	int newc=-1;
++    	for (int i=0; i<available.length; i++){
++    		if(available[i]==true){
++    			newc=i;
++    			break;
++    		}
++    	}
++		if(newc!=oldVal){
++			isUpdated=true;
++			if(getSuperstep()>500)
++				Log.info("SEREF has updated\t"+getVertexId()+"\tOld-new color:"+getVertexValue()+"-"+newc);
++		}
++		
++        setVertexValue(new Text(newc+""));
++        needsOperation = false;
++        voteToHalt();
++        
++        return isUpdated;
++    }      
++    
++    public boolean operate_tGiraph_coloring(Map<Long, String> msgListMainMap) {
++		return operate_dGiraph_coloring(msgListMainMap,true);
++    }          
++    
++ 	private void iterateMessages(long mymax, boolean isColoring) {
++ 		if(msgListMainMap.isEmpty()){
++ 			return;
++ 		}
++ 		for (String msgStr : msgListMainMap.values()) {
++     		String tmp[]=msgStr.split(":");
++     		long id=Long.parseLong(tmp[1]);
++     		int value = Integer.parseInt(tmp[2]);
++     		//Log.info("SEREF Read the M1 message:\t" + id + ":" + value);
++     		if(!isColoring){
++     			mymax = Math.max(mymax, value); 
++     		}
++     		else{
++         		vertexValues.put(new LongWritable(id), new Text(tmp[2]));
++     		}    		
++     	}
++     	msgListMainMap.clear();		
++ 	}
++ 	
++ 	private void iterateVertexValues(long mymax, boolean isColoring) {
++ 		Iterator<Entry<LongWritable, Text>> it = vertexValues.entrySet().iterator();
++     	while(it.hasNext()){
++     		Entry<LongWritable, Text> e = it.next();
++     		long id = e.getKey().get();
++     		int value = Integer.parseInt(e.getValue().toString());
++     		//Log.info("SEREF Read the local value:\t" + id + ":" + value);
++     		if(!isColoring){
++     			mymax = Math.max(mymax, value); 
++     		}
++     		else{
++     			if(value<colorsLength){
++ 	    			available[value]=false;
++ 	    		} 
++     		}
++     	}		
++ 	}
++    
++	private void initForks(long my_id) {
++		if(!isInternal){ // Initially get the fork if you have lower ID
++    		for( Long neighborFakeId : fakeIdList){
++    			long neighbor_id = (long) (neighborFakeId % Math.pow(10, length));
++    			if(VERSION_OF_JOB.equals("dGiraph_coloring")){
++    				nonlocalNeighborCount++;
++    				if(fakeId<neighborFakeId){
++    					myForkMap.put(neighbor_id, "DIRTY");
++    				}
++    			}
++    			else if(!isLocalMap.get(new LongWritable(neighbor_id))){
++					nonlocalNeighborCount++;
++    				if(fakeId<neighborFakeId){
++    					myForkMap.put(neighbor_id, "DIRTY");
++    				}
++				}
++    		}
++    	}		
++	}
++
++	private boolean detectHasAllCleanOrNoRequest() {
++    	for( LongWritable idlong : allEdgeIndexList){
++    		long neighbor_id = idlong.get();
++    		if( !isLocalMap.get(idlong) || VERSION_OF_JOB.equals("dGiraph_coloring") ){
++    			if(inReqList.contains(neighbor_id) && myForkMap.get(neighbor_id).equals("DIRTY")){
++    				return false;
++    			}
++    		}
++    	}
++    	return true;
++	}
++
++	private void requestMissingForks(long my_id) {
++		Text m3_msg = new Text("M3:"+my_id);
++		for( LongWritable idlong : allEdgeIndexList){
++			long neighbor_id = idlong.get();
++    		if( !isLocalMap.get(idlong) || VERSION_OF_JOB.equals("dGiraph_coloring") ){
++				if(!myForkMap.containsKey(neighbor_id) && !outReqMap.containsKey(idlong)){
++					sendMsg(idlong, m3_msg);
++					outReqMap.put(idlong, true);
++					//Log.info("SEREF sent fork request "+m3_msg+" to "+neighbor_id);
++				}
++    		}
++		}		
++	}
++
++
++	private void handleForkRequestMessages(long my_id) {
++		Text m2_msg = new Text("M2:"+my_id);
++    	Iterator<Long> it = inReqList.iterator();
++    	while(it.hasNext()){
++    		long reqID = it.next();
++    		if(myForkMap.get(reqID)==null){
++    			it.remove();
++    		}
++    		else if(myForkMap.get(reqID).equals("DIRTY")){
++    			sendMsg(new LongWritable(reqID), m2_msg);
++    			//Log.info("SEREF sent fork "+m2_msg+" to vertex "+reqID);
++    			myForkMap.remove(reqID);
++    			it.remove();
++    		}
++    		else if(myForkMap.get(reqID).equals("CLEAN")){}
++    	}
++	}
++
++	private void splitIncomingMessages(Iterator<Text> msgIterator) {
++		while (msgIterator.hasNext()) {
++    		String tmp=msgIterator.next().toString();
++    		//Log.info("SEREF Incoming message is:\t"+tmp);
++    		
++    		if(tmp.split(":")[0].equals("M1")){
++    			needsOperation = true;
++    			long neighbor_id = Long.parseLong(tmp.split(":")[1]);
++    			
++    			if(getSuperstep()==1){
++    				incomingEdgeIndexList.add(new LongWritable(neighbor_id));			
++    			}
++    			else{
++    				msgListMainMap.put(neighbor_id, tmp);
++    			}
++    		}
++    		else if(tmp.split(":")[0].equals("M2") && !isInternal){
++    			String idStr = tmp.split(":")[1];
++    			String[] idList = idStr.split("_");
++    			for(String id : idList){				
++    				outReqMap.remove(new LongWritable(Long.parseLong(id)));
++    				myForkMap.put(Long.parseLong(id),"CLEAN");
++    			}
++    		}
++    		else if(tmp.split(":")[0].equals("M3")  && !isInternal){
++    			String idStr = tmp.split(":")[1];
++    			String[] idList = idStr.split("_");
++    			for(String id : idList){
++    				inReqList.add(Long.parseLong(id));
++    			}
++    		}
++    		else if(tmp.split(":")[0].equals("M4")  && !isInternal){
++    			String idStr = tmp.split(":")[1];
++    			String[] idList = idStr.split("_");
++    			for(String id : idList){
++    				fakeIdList.add(Long.parseLong(id));
++    			}
++    		}
++    		else{
++    			Log.info("SEREF Unexpected message type");
++    		}
++    	}		
++	}
++
++	private void initAllEdgeIndexList() {
++		allEdgeIndexList.addAll(incomingEdgeIndexList);
++    	allEdgeIndexList.addAll(destEdgeIndexList);
++    	HashSet<LongWritable> hs = new HashSet<LongWritable>();
++    	hs.addAll(allEdgeIndexList);
++    	
++    	allEdgeIndexList.clear();
++    	allEdgeIndexList.addAll(hs);	
++    	incomingEdgeIndexList=null;
++	}
++    
++	private boolean operateVersioned() {
++		boolean isUpdated=false;
++		if(VERSION_OF_JOB.equals("orig_max")){
++			isUpdated=operate_dGiraph_max(msgListMainMap,false);
++		}
++		else if(VERSION_OF_JOB.equals("dGiraph_max")){
++			isUpdated=operate_dGiraph_max(msgListMainMap,true);
++		}
++		else if(VERSION_OF_JOB.equals("dGiraph_coloring")){
++			isUpdated=operate_dGiraph_coloring(msgListMainMap,false);
++		}
++		else if(VERSION_OF_JOB.equals("dGiraphx_coloring")){
++			isUpdated=operate_dGiraph_coloring(msgListMainMap,true);
++		}		
++		return isUpdated;
++	}
++
++	private void sendMsgToAllVersioned(Text msg) {
++		if(VERSION_OF_JOB.equals("dGiraph_coloring")){
++    		sendMsgToAllEdges(msg, allEdgeIndexList);
++		}
++		else if(VERSION_OF_JOB.equals("dGiraphx_coloring")){
++    		sendMsgToDistantEdges(msg, allEdgeIndexList);
++		}
++	}
++
++	private void initAvailableColors(int maxDegree) {
++    	colorsLength = 2*maxDegree+5;
++    	available = new boolean[colorsLength];
++    	Arrays.fill(available, true);		
++	}
++    
++    
++    
++    
++    
++    
++
++    
++    
++    public static class GiraphxWorkerContext extends
++    WorkerContext {
++
++		public static long finalSum;
++		public static double finalMax;
++		
++		@Override
++		public void preApplication() 
++		throws InstantiationException, IllegalAccessException {
++			//Log.info("SEREF aggregator registered");
++			registerAggregator("sum", LongSumAggregator.class);
++			registerAggregator("prsum", LongSumAggregator.class);
++			
++			registerAggregator("operatedSum", LongSumAggregator.class);
++    		registerAggregator("max", MaxAggregator.class);			
++		}
++		
++		@Override
++		public void postApplication() {}
++		
++		@Override
++		public void preSuperstep() {
++			
++		    LongSumAggregator sumAggreg = 
++		    	(LongSumAggregator) getAggregator("sum");
++		    LongSumAggregator prsumAggreg = 
++			    	(LongSumAggregator) getAggregator("prsum");
++
++		    LongSumAggregator operatedAgg = 
++			    	(LongSumAggregator) getAggregator("operatedSum");
++		    MaxAggregator maxAggreg = 
++		        	(MaxAggregator) getAggregator("max");
++		    
++		    maxDegree = (int) maxAggreg.getAggregatedValue().get();
++		    updatedVertexCount = sumAggreg.getAggregatedValue().get();
++		    prDifferenceSum = prsumAggreg.getAggregatedValue().get();
++		    operatedVertexCount = operatedAgg.getAggregatedValue().get();
++	    
++		    useAggregator("sum");
++		    useAggregator("prsum");
++		    useAggregator("operatedSum");
++	        useAggregator("max");
++
++		    sumAggreg.setAggregatedValue(new LongWritable(0L));
++		    prsumAggreg.setAggregatedValue(new LongWritable(0L));
++		    operatedAgg.setAggregatedValue(new LongWritable(0L));
++
++		}
++		
++		@Override
++		public void postSuperstep() { }
++    }
++
++
++
++    
++
++    /**
++     * VertexInputFormat that supports {@link Giraphx}
++     */
++    public static class GiraphxInputFormat extends
++            TextVertexInputFormat<LongWritable,
++                                  Text,
++                                  Text,
++                                  Text> {
++        @Override
++        public VertexReader<LongWritable, Text, Text, Text>
++                createVertexReader(InputSplit split,
++                                   TaskAttemptContext context)
++                                   throws IOException {
++            return new GiraphxVertexReader(
++                textInputFormat.createRecordReader(split, context));
++        }
++    }
++
++    /**
++     * VertexReader that supports {@link Giraphx}.  In this
++     * case, the edge values are not used.  The files should be in the
++     * following JSON format:
++     * JSONArray(<vertex id>, <vertex value>,
++     *           JSONArray(JSONArray(<dest vertex id>, <edge value>), ...))
++     * Here is an example with vertex id 1, vertex value 4.3, and two edges.
++     * First edge has a destination vertex 2, edge value 2.1.
++     * Second edge has a destination vertex 3, edge value 0.7.
++     * [1,4.3,[[2,2.1],[3,0.7]]]
++     */
++    public static class GiraphxVertexReader extends
++            TextVertexReader<LongWritable,
++            Text, Text, Text> {
++
++        public GiraphxVertexReader(
++                RecordReader<LongWritable, Text> lineRecordReader) {
++            super(lineRecordReader);
++        }
++
++        @Override
++        public BasicVertex<LongWritable, Text, Text,
++        Text> getCurrentVertex()
++            throws IOException, InterruptedException {
++        	
++          BasicVertex<LongWritable, Text, Text,
++          Text> vertex = BspUtils.<LongWritable, Text, Text,
++            		  Text>createVertex(getContext().getConfiguration());
++
++          String partitionerType = getContext().getConfiguration().get(PARTITIONER_TYPE);
++
++            Text line = getRecordReader().getCurrentValue();
++            try {
++                JSONArray jsonVertex = new JSONArray(line.toString());
++                LongWritable vertexId = new LongWritable(jsonVertex.getLong(0));
++                LongWritable partitionId = new LongWritable(-1);
++                Text vertexValue = new Text(jsonVertex.getString(1));
++                Map<LongWritable, Text> edges = Maps.newHashMap();
++                JSONArray jsonEdgeArray;
++                //Log.info("SEREF in vertexreader: "+partitionerType);
++                if(partitionerType.equals("metis")){
++                	partitionId = new LongWritable(jsonVertex.getInt(2));
++                    jsonEdgeArray = jsonVertex.getJSONArray(3);
++                    //vertex.partitionId = partitionId;
++                    //BspUtils.addToMetisMap(vertexId, partitionId);
++                }else if(partitionerType.equals("nometis")){
++                	partitionId = new LongWritable(jsonVertex.getInt(2));
++                    jsonEdgeArray = jsonVertex.getJSONArray(3);
++                    //vertex.partitionId = partitionId;
++                    //BspUtils.addToMetisMap(vertexId, partitionId);
++                }else{
++                	jsonEdgeArray= jsonVertex.getJSONArray(2);
++                }
++                
++                for (int i = 0; i < jsonEdgeArray.length(); ++i) {
++                    JSONArray jsonEdge = jsonEdgeArray.getJSONArray(i);
++                    edges.put(new LongWritable(jsonEdge.getLong(0)),
++                            new Text(jsonEdge.getString(1)));
++                }
++                vertex.initialize(vertexId, vertexValue, edges, null);
++            } catch (JSONException e) {
++                throw new IllegalArgumentException(
++                    "next: Couldn't get vertex from line " + line, e);
++            }
++            return vertex;
++        }
++
++        @Override
++        public boolean nextVertex() throws IOException, InterruptedException {
++            return getRecordReader().nextKeyValue();
++        }
++    }
++
++    /**
++     * VertexOutputFormat that supports {@link SimpleShortestPathsVertex}
++     */
++    public static class GiraphxOutputFormat extends
++            TextVertexOutputFormat<LongWritable, Text,
++            Text> {
++
++        @Override
++        public VertexWriter<LongWritable, Text, Text>
++                createVertexWriter(TaskAttemptContext context)
++                throws IOException, InterruptedException {
++            RecordWriter<Text, Text> recordWriter =
++                textOutputFormat.getRecordWriter(context);
++            return new GiraphxWriter(recordWriter);
++        }
++    }
++
++    /**
++     * VertexWriter that supports {@link SimpleShortestPathsVertex}
++     */
++    public static class GiraphxWriter extends
++            TextVertexWriter<LongWritable, Text, Text> {
++        public GiraphxWriter(
++                RecordWriter<Text, Text> lineRecordWriter) {
++            super(lineRecordWriter);
++        }
++
++        @Override
++        public void writeVertex(BasicVertex<LongWritable, Text,
++        		Text, ?> vertex)
++                throws IOException, InterruptedException {
++            JSONArray jsonVertex = new JSONArray();
++            jsonVertex.put(vertex.getVertexId().get());
++			jsonVertex.put(vertex.getVertexValue().toString());
++			JSONArray jsonEdgeArray = new JSONArray();
++			for (LongWritable targetVertexId : vertex) {
++			    JSONArray jsonEdge = new JSONArray();
++			    jsonEdge.put(targetVertexId.get());
++			    jsonEdge.put(vertex.getEdgeValue(targetVertexId).toString());
++			    jsonEdgeArray.put(jsonEdge);
++			}
++			jsonVertex.put(jsonEdgeArray);
++            getRecordWriter().write(new Text(jsonVertex.toString()), null);
++        }
++    }
++
++    @Override
++    public Configuration getConf() {
++        return conf;
++    }
++
++    @Override
++    public void setConf(Configuration conf) {
++        this.conf = conf;
++    }
++
++    @Override
++    public int run(String[] argArray) throws Exception {
++        Preconditions.checkArgument(argArray.length >= 7,
++            "run: Must have 6 arguments <input path> <output path> " +
++            "<source vertex id> <# of workers> <# of vertices> <method> <supersteps>");
++
++        GiraphJob job = new GiraphJob(getConf(), getClass().getName());
++        job.setVertexClass(getClass());
++        job.setWorkerContextClass(
++        		GiraphxWorkerContext.class);
++        job.setVertexInputFormatClass(
++        		GiraphxInputFormat.class);
++        job.setVertexOutputFormatClass(
++        		GiraphxOutputFormat.class);
++        FileInputFormat.addInputPath(job, new Path(argArray[0]));
++        FileOutputFormat.setOutputPath(job, new Path(argArray[1]));
++        job.getConfiguration().setLong(Giraphx.SOURCE_ID,
++                                       Long.parseLong(argArray[2]));
++        job.setWorkerConfiguration(Integer.parseInt(argArray[3]),
++                                   Integer.parseInt(argArray[3]),
++                                   100.0f);
++        
++        int vertexNum = Integer.parseInt(argArray[4]);
++        Log.info("vertexNum "+vertexNum);
++        job.setVertexNumConfiguration(vertexNum);
++        
++        job.getConfiguration().set(Giraphx.VERSION_OF_JOB_CONF,
++                argArray[5]);
++        
++        job.getConfiguration().setInt(Giraphx.MAX_SUPERSTEPS_CONF,
++                Integer.parseInt(argArray[6]));
++        
++        String partitioner = "mesh";
++        if(argArray.length > 7){
++        	partitioner = argArray[7];
++        }
++        job.setPartitionerTypeConfiguration(partitioner);
++        job.getConfiguration().set(Giraphx.PARTITIONER_TYPE,
++        		partitioner);
++        //job.getConfiguration().setInt("mapreduce.job.counters.limit", 5000);
++        DistributedCache.addCacheFile(new URI("hdfs://localhost:54310/user/aeyate/input/web-Google.txt.metised.part.100"), 
++        		getConf());
++        Log.info("SEREF Configuration is: "+getConf().toString());
++
++        
++        return job.run(true) ? 0 : -1;
++    }
++
++    public static void main(String[] args) throws Exception {
++        System.exit(ToolRunner.run(new Giraphx(), args));
++    }
++}
+diff -rupN org2/apache/giraph/examples/PageRankCombiner.java org/apache/giraph/examples/PageRankCombiner.java
+--- org2/apache/giraph/examples/PageRankCombiner.java	1969-12-31 19:00:00.000000000 -0500
++++ org/apache/giraph/examples/PageRankCombiner.java	2013-07-25 02:29:23.733116000 -0400
+@@ -0,0 +1,48 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++package org.apache.giraph.examples;
++
++import org.apache.giraph.graph.VertexCombiner;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * {@link VertexCombiner} that finds the sum of messages in {@link Text} format
++ */
++public class PageRankCombiner
++        extends VertexCombiner<LongWritable, Text> {
++
++    @Override
++    public Iterable<Text> combine(LongWritable target,
++    		Iterable<Text> messages) throws IOException {
++    	double sum = 0;	        
++    	for (Text message : messages) {
++    		sum += Double.parseDouble(message.toString());
++        }
++
++        List<Text> value = new ArrayList<Text>();
++        value.add(new Text(sum+""));
++        
++        return value;
++    }
++}
+diff -rupN org2/apache/giraph/graph/BasicVertex.java org/apache/giraph/graph/BasicVertex.java
+--- org2/apache/giraph/graph/BasicVertex.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/BasicVertex.java	2013-09-18 23:24:42.537737505 -0400
+@@ -26,6 +26,7 @@ import org.apache.hadoop.mapreduce.Mappe
+ 
+ import java.io.IOException;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Map;
+ 
+  /**
+@@ -46,6 +47,10 @@ public abstract class BasicVertex<I exte
+     private Configuration conf;
+     /** If true, do not do anymore computation on this vertex. */
+     boolean halt = false;
++    protected boolean isInternal = false;
++	public boolean needsOperation = true;
++    
++   // public I partitionId;
+ 
+     /**
+      * This method must be called after instantiation of a vertex with BspUtils
+@@ -53,6 +58,7 @@ public abstract class BasicVertex<I exte
+      *
+      * @param vertexId Will be the vertex id
+      * @param vertexValue Will be the vertex value
++     * @param partitionId 
+      * @param edges A map of destination edge ids to edge values (can be null)
+      * @param messages Initial messages for this vertex (can be null)
+      */
+@@ -68,6 +74,7 @@ public abstract class BasicVertex<I exte
+      */
+     public abstract void compute(Iterator<M> msgIterator) throws IOException;
+ 
++    
+     /**
+      * Retrieves the current superstep.
+      *
+@@ -162,6 +169,20 @@ public abstract class BasicVertex<I exte
+             throw new IllegalArgumentException(
+                 "sendMsg: Cannot send null message to " + id);
+         }
++        incrementTotalMessagesSent();
++        incrementSS0MessagesSent();
++        incrementSS1MessagesSent();
++        String tmp[]=msg.toString().split(":");
++        if(tmp[0].equals("M1")){
++        	incrementLaterValueMessagesSent();
++        	incrementValueMessagesSent();
++            incrementSS1ValueMessagesSent();
++        }
++        else if(tmp[0].equals("M2") || tmp[0].equals("M3") || tmp[0].equals("M4")){
++        	incrementLaterDiningMessagesSent();
++        	incrementDiningMessagesSent();
++        }
++        //Log.info("SEREF Outgoing message is:\t"+msg);
+         getGraphState().getWorkerCommunications().
+             sendMessageReq(id, msg);
+     }
+@@ -212,7 +233,7 @@ public abstract class BasicVertex<I exte
+      *
+      * @return Graph state for all workers
+      */
+-    GraphState<I, V, E, M> getGraphState() {
++    public GraphState<I, V, E, M> getGraphState() {
+         return graphState;
+     }
+ 
+@@ -273,4 +294,77 @@ public abstract class BasicVertex<I exte
+     public void setConf(Configuration conf) {
+         this.conf = conf;
+     }
++
++    //**************************** SEREF-START ********************************//
++	public void sendMsgToDistantEdges(M msg, List<I> allEdgeIndexList) {
++		// TODO Auto-generated method stub
++		
++	}
++	public void sendMsgToAllEdges(M msg, List<I> allEdgeIndexList) {
++		// TODO Auto-generated method stub	
++	}
++	
++    public void incrementTotalMessagesSent(){
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Total messages sent").increment(1);
++    }
++    
++    public void incrementSS0MessagesSent(){
++    	if(getSuperstep()!=0) return;
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Total messages sent at Superstep 0").increment(1);
++    }
++
++    public void incrementSS1MessagesSent(){
++    	if(getSuperstep()!=1) return;
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Total messages sent at Superstep 1").increment(1);
++    }
++    
++    public void incrementSS1ValueMessagesSent(){
++    	if(getSuperstep()!=1) return;
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Total value messages sent at Superstep 1").increment(1);
++    }
++    
++    public void incrementDiningMessagesSent(){
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Dining messages sent").increment(1);
++    }
++    
++    public void incrementValueMessagesSent(){
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "VertexValue messages sent").increment(1);
++    }
++    
++    public void incrementLaterDiningMessagesSent(){
++    	if(getSuperstep()<=1) return;
++
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Later Dining messages sent").increment(1);
++    }
++    
++    public void incrementLaterValueMessagesSent(){
++    	if(getSuperstep()<=1) return;
++
++	    String GIRAPH_TIMERS_COUNTER_GROUP_NAME = "Giraph Stats";
++			getContext().getCounter(
++	            GIRAPH_TIMERS_COUNTER_GROUP_NAME,
++	            "Later VertexValue messages sent").increment(1);
++    }
++    //**************************** SEREF-END ********************************//
+ }
+diff -rupN org2/apache/giraph/graph/BspServiceMaster.java org/apache/giraph/graph/BspServiceMaster.java
+--- org2/apache/giraph/graph/BspServiceMaster.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/BspServiceMaster.java	2013-07-25 02:29:23.935917000 -0400
+@@ -129,6 +129,8 @@ public class BspServiceMaster<
+     public String GIRAPH_STATS_COUNTER_GROUP_NAME = "Giraph Stats";
+     /** Aggregator writer */
+     public AggregatorWriter aggregatorWriter;
++	private final int numVertices;
++	private final String partitionerType;
+ 
+     public BspServiceMaster(
+             String serverPortList,
+@@ -138,6 +140,10 @@ public class BspServiceMaster<
+         super(serverPortList, sessionMsecTimeout, context, graphMapper);
+         registerBspEvent(superstepStateChanged);
+ 
++        numVertices = 
++        		getConfiguration().getInt(GiraphJob.NUM_VERTICES, -1);
++        partitionerType = 
++        		getConfiguration().get(GiraphJob.PARTITIONER_TYPE, "mesh");
+         maxWorkers =
+             getConfiguration().getInt(GiraphJob.MAX_WORKERS, -1);
+         minWorkers =
+@@ -492,6 +498,7 @@ public class BspServiceMaster<
+ 
+         // Note that the input splits may only be a sample if
+         // INPUT_SPLIT_SAMPLE_PERCENT is set to something other than 100
++        PartitionUtils.workerCount = healthyWorkerInfoList.size();
+         List<InputSplit> splitList =
+             generateInputSplits(healthyWorkerInfoList.size());
+         if (healthyWorkerInfoList.size() > splitList.size()) {
+diff -rupN org2/apache/giraph/graph/BspServiceWorker.java org/apache/giraph/graph/BspServiceWorker.java
+--- org2/apache/giraph/graph/BspServiceWorker.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/BspServiceWorker.java	2013-09-18 19:07:57.005345611 -0400
+@@ -33,13 +33,17 @@ import org.apache.giraph.utils.MemoryUti
+ import org.apache.giraph.utils.WritableUtils;
+ import org.apache.giraph.zk.BspEvent;
+ import org.apache.giraph.zk.PredicateLock;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.filecache.DistributedCache;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+ import org.apache.hadoop.mapreduce.InputSplit;
+ import org.apache.hadoop.mapreduce.Mapper;
++import org.apache.hadoop.mapreduce.Mapper.Context;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.log4j.Logger;
+ import org.apache.zookeeper.CreateMode;
+@@ -51,12 +55,17 @@ import org.apache.zookeeper.data.Stat;
+ import org.json.JSONArray;
+ import org.json.JSONException;
+ import org.json.JSONObject;
++import org.mortbay.log.Log;
+ 
++import java.io.BufferedReader;
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.DataInputStream;
+ import java.io.DataOutput;
+ import java.io.DataOutputStream;
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.FileReader;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.net.UnknownHostException;
+@@ -116,12 +125,64 @@ public class BspServiceWorker<
+     /** Class logger */
+     private static final Logger LOG = Logger.getLogger(BspServiceWorker.class);
+ 
++    //**************************** SEREF-START ********************************//
++    public Map<I,BasicVertex<I,V,E,M>> vertexMap = new HashMap<I,BasicVertex<I,V,E,M>>();
++    
++    public void prepareVertexMap(){
++        Log.info(MemoryUtils.getRuntimeMemoryStats());
++    	LOG.info("Preparing vertexMap");
++    	for (Partition<I, V, E, M> partition : getPartitionMap().values()) {
++    		for (BasicVertex<I, V, E, M> vertex : partition.getVertices()) {
++    			vertexMap.put(vertex.getVertexId(), vertex);
++    		}
++    	}
++    	LOG.info("Finished loading vertexMap");
++        Log.info(MemoryUtils.getRuntimeMemoryStats());
++    }
++    
++    public Map<I,BasicVertex<I,V,E,M>> getVertexMap(){
++    	return vertexMap;
++    }
++    
++    public void initAndFillMetisArray(Configuration configuration){
++        Log.info("SEREF Configuration is: "+configuration.toString());
++    	BspUtils.initMetisMap(getConfiguration().getInt(GiraphJob.NUM_VERTICES, -1));
++        Path[] files=null;
++		try {
++			files = DistributedCache.getLocalCacheFiles(configuration);
++		} catch (IOException e1) {
++			// TODO Auto-generated catch block
++			e1.printStackTrace();
++		}
++        File myFile = new File(files[0].toString());
++        Log.info("SEREF metis file is: "+myFile.toString());
++        BufferedReader br = null;
++		try {
++			br = new BufferedReader(new FileReader(myFile));
++			int ctr=0;
++			String line;
++			while ((line = br.readLine()) != null && ctr<BspUtils.metisMap.length-1) {
++				ctr++;
++				//Log.info("SEREF metis partition is: "+line);
++				int partition = Integer.parseInt(line);
++				BspUtils.addToMetisMap(new LongWritable(ctr), new LongWritable(partition));
++			}
++			br.close();
++		} catch (FileNotFoundException e) {		
++		} catch (IOException e1) {}
++
++    }
++
++  //**************************** SEREF-END ********************************//
++
++    
+     public BspServiceWorker(
+             String serverPortList,
+             int sessionMsecTimeout,
+             Mapper<?, ?, ?, ?>.Context context,
+             GraphMapper<I, V, E, M> graphMapper,
+-            GraphState<I, V, E,M> graphState)
++            GraphState<I, V, E,M> graphState,
++            int workerID)
+             throws UnknownHostException, IOException, InterruptedException {
+         super(serverPortList, sessionMsecTimeout, context, graphMapper);
+         registerBspEvent(partitionExchangeChildrenChanged);
+@@ -138,7 +199,7 @@ public class BspServiceWorker<
+                 GiraphJob.INPUT_SPLIT_MAX_VERTICES,
+                 GiraphJob.INPUT_SPLIT_MAX_VERTICES_DEFAULT);
+         workerInfo =
+-            new WorkerInfo(getHostname(), getTaskPartition(), finalRpcPort);
++            new WorkerInfo(getHostname(), getTaskPartition(), finalRpcPort, workerID);
+         workerGraphPartitioner =
+             getGraphPartitionerFactory().createWorkerGraphPartitioner();
+         commService = new RPCCommunications<I, V, E, M>(
+@@ -147,6 +208,16 @@ public class BspServiceWorker<
+         this.workerContext =
+             BspUtils.createWorkerContext(getConfiguration(),
+                                          graphMapper.getGraphState());
++        
++        Log.info(MemoryUtils.getRuntimeMemoryStats());
++        Log.info("Metis map is loading..");
++        if(getConfiguration().get(GiraphJob.PARTITIONER_TYPE, "mesh").equals("metis")){
++        	initAndFillMetisArray(context.getConfiguration());
++        }
++        Log.info(MemoryUtils.getRuntimeMemoryStats());
++        
++
++
+     }
+ 
+     public WorkerContext getWorkerContext() {
+@@ -238,6 +309,7 @@ public class BspServiceWorker<
+                                       + percentFinished +
+                                      "% input splits finished");
+                         }
++                        Log.info(MemoryUtils.getRuntimeMemoryStats());
+                         return reservedInputSplitPath;
+                     } catch (KeeperException.NodeExistsException e) {
+                         LOG.info("reserveInputSplit: Couldn't reserve " +
+@@ -365,6 +437,8 @@ public class BspServiceWorker<
+             LOG.info("loadVerticesFromInputSplit: Finished loading " +
+                      inputSplitPath + " " + vertexEdgeCount);
+         }
++        Log.info(MemoryUtils.getRuntimeMemoryStats());
++
+         markInputSplitPathFinished(inputSplitPath);
+         return vertexEdgeCount;
+     }
+@@ -440,8 +514,8 @@ public class BspServiceWorker<
+                     BspUtils.<V>createVertexValue(getConfiguration()));
+             }
+             PartitionOwner partitionOwner =
+-                workerGraphPartitioner.getPartitionOwner(
+-                    readerVertex.getVertexId());
++                workerGraphPartitioner.getMeshPartitionOwner( 
++                    readerVertex.getVertexId(), this);
+             Partition<I, V, E, M> partition =
+                 inputSplitCache.get(partitionOwner);
+             if (partition == null) {
+@@ -911,7 +985,7 @@ public class BspServiceWorker<
+         //    of this worker
+         // 5. Let the master know it is finished.
+         // 6. Wait for the master's global stats, and check if done
+-        long workerSentMessages = 0;//
++        long workerSentMessages = 0;
+         try {
+             workerSentMessages = commService.flush(getContext());
+         } catch (IOException e) {
+@@ -1002,6 +1076,8 @@ public class BspServiceWorker<
+         getGraphMapper().getGraphState().
+             setNumEdges(globalStats.getEdgeCount()).
+             setNumVertices(globalStats.getVertexCount());
++        Log.info("SEREF: finishSuperstep: Global finished vertex count is:"
++            +globalStats.getFinishedVertexCount());
+         return ((globalStats.getFinishedVertexCount() ==
+                 globalStats.getVertexCount()) &&
+                 (globalStats.getMessageCount() == 0));
+@@ -1385,6 +1461,9 @@ public class BspServiceWorker<
+                     new Partition<I, V, E, M>(getConfiguration(),
+                                               entry.getKey());
+                 for (BasicVertex<I, V, E, M> vertex : entry.getValue()) {
++                	//Log.info("SEREF received vertex: "+(LongWritable) (vertex.getVertexId())
++                		//	+"\t"+(LongWritable) (vertex.partitionId));
++                	//BspUtils.addToMetisMap((LongWritable) (vertex.getVertexId()), (LongWritable) (vertex.partitionId));
+                     if (tmpPartition.putVertex(vertex) != null) {
+                         throw new IllegalStateException(
+                             "moveVerticesToWorker: Vertex " + vertex +
+@@ -1463,7 +1542,7 @@ public class BspServiceWorker<
+ 
+     @Override
+     public PartitionOwner getVertexPartitionOwner(I vertexIndex) {
+-        return workerGraphPartitioner.getPartitionOwner(vertexIndex);
++        return workerGraphPartitioner.getMeshPartitionOwner(vertexIndex,this);
+     }
+ 
+     public Partition<I, V, E, M> getPartition(I vertexIndex) {
+diff -rupN org2/apache/giraph/graph/BspUtils.java org/apache/giraph/graph/BspUtils.java
+--- org2/apache/giraph/graph/BspUtils.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/BspUtils.java	2013-07-25 02:29:24.029517000 -0400
+@@ -18,19 +18,62 @@
+ 
+ package org.apache.giraph.graph;
+ 
++import java.util.HashMap;
++import java.util.Map;
++
+ import org.apache.giraph.graph.partition.GraphPartitionerFactory;
+ import org.apache.giraph.graph.partition.HashPartitionerFactory;
+ import org.apache.giraph.graph.partition.PartitionStats;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+ import org.apache.hadoop.util.ReflectionUtils;
++import org.mortbay.log.Log;
+ 
+ /**
+  * Help to use the configuration to get the appropriate classes or
+  * instantiate them.
+  */
+ public class BspUtils {
++	
++	public static Object syncObject = new Object();
++	public static int[] metisMap;
++	public static boolean isCreated = false;
++	public static void initMetisMap(int size){
++		//Log.info("SEREF metisMap size "+size);
++
++		synchronized(syncObject){
++			if(!isCreated){
++				Log.info("SEREF metisMap size "+size);
++				isCreated = true;
++				metisMap = new int[size+1];
++				for(int i=0; i<metisMap.length; i++){
++					metisMap[i]=-1;
++				}
++			}
++		}
++	}
++	public static void addToMetisMap(LongWritable id, LongWritable partition){
++		//Log.info("SEREF metisMap "+id+"\t"+partition);
++		synchronized(syncObject){
++			metisMap[(int) (id.get())]=(int) (partition.get());
++		}
++	}
++	public static int getFromMetisMap(int id){
++		//Log.info("SEREF metisMap "+id+"\t"+partition);
++		synchronized(syncObject){
++			return metisMap[id];
++		}
++	}
++	public static void printMetisMap(){
++		synchronized(syncObject){
++			for(int i=0; i<metisMap.length; i++){
++				Log.info(metisMap[i]+"");
++			}
++		}
++	}
++	
+     /**
+      * Get the user's subclassed {@link GraphPartitionerFactory}.
+      *
+diff -rupN org2/apache/giraph/graph/EdgeListVertex.java org/apache/giraph/graph/EdgeListVertex.java
+--- org2/apache/giraph/graph/EdgeListVertex.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/EdgeListVertex.java	2013-09-17 13:19:53.242682276 -0400
+@@ -20,9 +20,12 @@ package org.apache.giraph.graph;
+ 
+ import com.google.common.collect.Iterables;
+ import org.apache.giraph.utils.ComparisonUtils;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+ import org.apache.log4j.Logger;
++import org.mortbay.log.Log;
+ 
+ import com.google.common.collect.Lists;
+ 
+@@ -35,6 +38,7 @@ import java.util.Comparator;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Random;
+ 
+ /**
+  * User applications can subclass {@link EdgeListVertex}, which stores
+@@ -58,7 +62,7 @@ public abstract class EdgeListVertex<I e
+     /** Vertex value */
+     private V vertexValue = null;
+     /** List of the dest edge indices */
+-    private List<I> destEdgeIndexList;
++    protected List<I> destEdgeIndexList;
+     /** List of the dest edge values */
+     /** Map of destination vertices and their edge values */
+     private List<E> destEdgeValueList;
+@@ -75,6 +79,7 @@ public abstract class EdgeListVertex<I e
+         if (vertexValue != null) {
+             setVertexValue(vertexValue);
+         }
++        
+         if (edges != null && !edges.isEmpty()) {
+             destEdgeIndexList = Lists.newArrayListWithCapacity(edges.size());
+             destEdgeValueList = Lists.newArrayListWithCapacity(edges.size());
+@@ -160,7 +165,7 @@ public abstract class EdgeListVertex<I e
+     public final I getVertexId() {
+         return vertexId;
+     }
+-
++ 
+     @Override
+     public final V getVertexValue() {
+         return vertexValue;
+@@ -234,11 +239,104 @@ public abstract class EdgeListVertex<I e
+             sendMsg(index, msg);
+         }
+     }
++    
++    
++  //**************************** SEREF-START ********************************//
++
++    @Override
++    public final void sendMsgToDistantEdges(M msg, List<I> allEdgeIndexList) {
++        Map<I,BasicVertex<I,V,E,M>> vertexMap =
++        		getGraphState().getWorkerCommunications().getServiceWorker().getVertexMap();
++        for (I index : allEdgeIndexList) {
++        	BasicVertex<I,V,E,M> bv = vertexMap.get(index);
++        	if(bv==null){
++        		//Log.info("SEREF: Distant vertex: " + index);
++        		sendMsg(index, msg);
++        	}
++        	else{
++        		bv.halt=false;
++        		bv.needsOperation = true;
++        	}
++        }
++    }
++    
++    public final boolean checkIsInternal(List<I> allEdgeIndexList) {
++    	Map<I,BasicVertex<I,V,E,M>> vertexMap =
++    		getGraphState().getWorkerCommunications().getServiceWorker().getVertexMap();
++        for (I index : allEdgeIndexList) {
++        	if(vertexMap.get(index) == null){
++        		return false;
++        	}
++        }
++        return true;
++    }    
++
+ 
+     @Override
++    public final void sendMsgToAllEdges(M msg, List<I> allEdgeIndexList) {
++        for (I index : allEdgeIndexList) {
++        	sendMsg(index, msg);
++        }
++    }
++    
++    public final boolean readFromAllNeighbors(Map<I, V> vertexValues, List<I> allEdgeIndexList) {
++    	Map<I,BasicVertex<I,V,E,M>> vertexMap =
++    		getGraphState().getWorkerCommunications().getServiceWorker().getVertexMap();
++        for (I index : allEdgeIndexList) {
++        	BasicVertex<I,V,E,M> bv = vertexMap.get(index);
++        	if(bv != null){
++        		vertexValues.put(bv.getVertexId(), bv.getVertexValue());
++        	}
++        }
++        return true;
++    }
++
++    /**
++     * Reads local neighbor pagerank values into vertexValues map.
++     */
++    public final void readPagerankFromNeighbors(Map<I, Text> vertexValues, List<I> allEdgeIndexList) {
++    	// Reads local neighbor values into vertexValues map
++    	Map<I,BasicVertex<I,V,E,M>> vertexMap =
++    		getGraphState().getWorkerCommunications().getServiceWorker().getVertexMap();
++        for (I index : allEdgeIndexList) {
++        	BasicVertex<I,V,E,M> bv = vertexMap.get(index);
++        	if(bv == null){
++        	}else{
++        		double val = Double.parseDouble(bv.getVertexValue().toString()) / bv.getNumOutEdges();
++        		vertexValues.put(bv.getVertexId(), new Text(val+""));
++        	}
++        }
++    }
++    
++    public final void isNeighborsLocal(Map<I,Boolean> isLocalMap, List<I> allEdgeIndexList) {
++    	Map<I,BasicVertex<I,V,E,M>> vertexMap =
++        		getGraphState().getWorkerCommunications().getServiceWorker().getVertexMap();
++    	for (I index : allEdgeIndexList) {
++        	BasicVertex<I,V,E,M> bv = vertexMap.get(index);
++        	if(bv==null){
++        		isLocalMap.put(index, false);
++        		if(getSuperstep()==2){
++        			getContext().getCounter("Giraph Stats", "Nonlocal edge count").increment(1);
++        		}
++        	}
++        	else{
++        		isLocalMap.put(index, true);
++        		if(getSuperstep()==2){
++    				getContext().getCounter("Giraph Stats",	"Local edge count").increment(1);
++    				getContext().getCounter("Giraph Stats",
++    						"Local edge of border vertex count").increment(1);
++        		}
++        	}
++    	}
++    }
++  //**************************** SEREF-END ********************************//
++  
++    @Override
+     final public void readFields(DataInput in) throws IOException {
+         vertexId = BspUtils.<I>createVertexIndex(getConf());
+         vertexId.readFields(in);
++        //partitionId = (I) new LongWritable();
++        //partitionId.readFields(in);
+         boolean hasVertexValue = in.readBoolean();
+         if (hasVertexValue) {
+             vertexValue = BspUtils.<V>createVertexValue(getConf());
+@@ -268,6 +366,7 @@ public abstract class EdgeListVertex<I e
+     @Override
+     final public void write(DataOutput out) throws IOException {
+         vertexId.write(out);
++        //partitionId.write(out);
+         out.writeBoolean(vertexValue != null);
+         if (vertexValue != null) {
+             vertexValue.write(out);
+diff -rupN org2/apache/giraph/graph/GiraphJob.java org/apache/giraph/graph/GiraphJob.java
+--- org2/apache/giraph/graph/GiraphJob.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/GiraphJob.java	2013-07-25 02:29:24.091917000 -0400
+@@ -33,6 +33,8 @@ import java.io.IOException;
+  * for our needs.  For instance, our job should not have any reduce tasks.
+  */
+ public class GiraphJob extends Job {
++	
++	
+     /** Vertex class - required */
+     public static final String VERTEX_CLASS = "giraph.vertexClass";
+     /** VertexInputFormat class - required */
+@@ -169,7 +171,7 @@ public class GiraphJob extends Job {
+     public static final String MAX_VERTICES_PER_PARTITION =
+         "giraph.maxVerticesPerPartition";
+     /** Default maximum number of vertices per partition before sending. */
+-    public static final int MAX_VERTICES_PER_PARTITION_DEFAULT = 100000;
++    public static final int MAX_VERTICES_PER_PARTITION_DEFAULT = 300000;
+ 
+     /** Maximum number of messages per peer before flush */
+     public static final String MSG_SIZE = "giraph.msgSize";
+@@ -589,4 +591,24 @@ public class GiraphJob extends Job {
+         setOutputFormatClass(BspOutputFormat.class);
+         return waitForCompletion(verbose);
+     }
++
++    //**************************** SEREF-START ********************************//
++	public static final String NUM_VERTICES = "giraph.numVertices";
++	public static final String PARTITIONER_TYPE = "giraph.partitionerType";
++	
++
++	/**
++	 * @param vertex_count
++	 */
++	public void setVertexNumConfiguration(int vertex_count) {
++		// TODO Auto-generated method stub
++		conf.setInt(NUM_VERTICES, vertex_count);
++	}
++	
++	public void setPartitionerTypeConfiguration(String partitionerType) {
++		// TODO Auto-generated method stub
++		conf.set(PARTITIONER_TYPE, partitionerType);
++	}
++	  //**************************** SEREF-END ********************************//
++
+ }
+diff -rupN org2/apache/giraph/graph/GraphMapper.java org/apache/giraph/graph/GraphMapper.java
+--- org2/apache/giraph/graph/GraphMapper.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/GraphMapper.java	2013-09-18 19:16:07.851779590 -0400
+@@ -19,6 +19,7 @@
+ package org.apache.giraph.graph;
+ 
+ import com.google.common.collect.Iterables;
++
+ import org.apache.giraph.bsp.CentralizedServiceWorker;
+ import org.apache.giraph.graph.partition.Partition;
+ import org.apache.giraph.graph.partition.PartitionOwner;
+@@ -33,6 +34,7 @@ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+ import org.apache.hadoop.mapreduce.Mapper;
+ import org.apache.log4j.Logger;
++import org.mortbay.log.Log;
+ 
+ import java.io.IOException;
+ import java.lang.reflect.Type;
+@@ -43,6 +45,7 @@ import java.util.Collection;
+ import java.util.Enumeration;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * This mapper that will execute the BSP graph tasks.  Since this mapper will
+@@ -91,6 +94,19 @@ public class GraphMapper<I extends Writa
+     public MapFunctions getMapFunctions() {
+         return mapFunctions;
+     }
++    
++  //**************************** SEREF-START ********************************//
++    private static int workerID=0;
++    
++    public void prepareVertexMap(){
++    	serviceWorker.prepareVertexMap();
++    }
++    
++    public Map<I,BasicVertex<I,V,E,M>> getVertexMap(){
++    	return serviceWorker.getVertexMap();
++    }
++  //**************************** SEREF-END ********************************//
++
+ 
+     /**
+      * Get the aggregator usage, a subset of the functionality
+@@ -451,7 +467,8 @@ public class GraphMapper<I extends Writa
+                     sessionMsecTimeout,
+                     context,
+                     this,
+-                    graphState);
++                    graphState,
++                    workerID++);
+                 if (LOG.isInfoEnabled()) {
+                     LOG.info("setup: Registering health of this worker...");
+                 }
+@@ -514,6 +531,7 @@ public class GraphMapper<I extends Writa
+                 "map: preApplication failed in access",e );
+         }
+         context.progress();
++        //BspUtils.printMetisMap();
+ 
+         List<PartitionStats> partitionStatsList =
+             new ArrayList<PartitionStats>();
+@@ -536,6 +554,28 @@ public class GraphMapper<I extends Writa
+             }
+             context.progress();
+ 
++
++          //**************************** SEREF-START ********************************//  		
++            prepareVertexMap();
++            LOG.info("Superstep started: " + superstep + " for worker " 
++            		+ serviceWorker.getWorkerInfo().toString());
++            
++            String VERSION_OF_JOB = conf.get("Giraphx.versionOfJob", "invalid_job");
++            Log.info("SEREF: GraphMapper: Version of job is: "+VERSION_OF_JOB);
++            
++            boolean token=false;
++            int numWorkers = conf.getInt(GiraphJob.MAX_WORKERS, -1);
++            int wid = serviceWorker.getWorkerInfo().getPartitionId();
++            if((wid % numWorkers) == ((int)superstep % numWorkers) 
++            		&& VERSION_OF_JOB.equals("tGiraphx_coloring")){
++            	token=true;
++            }
++			WorkerContext.token = token;         
++            
++            Log.info("TOKEN INFORMATION: Worker number is "+numWorkers+".Worker id is "
++            		+wid+". Token is "+token+" in superstep "+ superstep);            
++          //**************************** SEREF-END ********************************//
++
+             serviceWorker.exchangeVertexPartitions(
+                 masterAssignedPartitionOwners);
+             context.progress();
+@@ -549,13 +589,14 @@ public class GraphMapper<I extends Writa
+                 serviceWorker.loadCheckpoint(
+                     serviceWorker.getRestartedSuperstep());
+             } else if (serviceWorker.checkpointFrequencyMet(superstep)) {
+-                serviceWorker.storeCheckpoint();
++                //serviceWorker.storeCheckpoint();
+             }
+ 
+             serviceWorker.getWorkerContext().setGraphState(graphState);
+             serviceWorker.getWorkerContext().preSuperstep();
+             context.progress();
+-
++            
++            int vertexCounter=0;
+             partitionStatsList.clear();
+             for (Partition<I, V, E, M> partition :
+                     serviceWorker.getPartitionMap().values()) {
+@@ -566,6 +607,13 @@ public class GraphMapper<I extends Writa
+                     // Make sure every vertex has the current
+                     // graphState before computing
+                     basicVertex.setGraphState(graphState);
++                    
++         //**************************** SEREF-START ********************************//
++                    if(token && basicVertex.needsOperation){
++                    	basicVertex.halt = false;
++                    }
++         //**************************** SEREF-END ********************************//
++                    
+                     if (basicVertex.isHalted()
+                             && !Iterables.isEmpty(basicVertex.getMessages())) {
+                         basicVertex.halt = false;
+@@ -574,17 +622,37 @@ public class GraphMapper<I extends Writa
+                         Iterator<M> vertexMsgIt =
+                             basicVertex.getMessages().iterator();
+                         context.progress();
+-                        basicVertex.compute(vertexMsgIt);
++                        
++         //**************************** SEREF-START ********************************//
++                        if((vertexCounter++)%5000 == 0){
++	                        Log.info(MemoryUtils.getRuntimeMemoryStats());
++	                        Log.info("SEREF Vertex counter is: "+vertexCounter);
++                        }
++                        basicVertex.compute(vertexMsgIt);                     
+                         basicVertex.releaseResources();
+                     }
++                    
+                     if (basicVertex.isHalted()) {
+-                        partitionStats.incrFinishedVertexCount();
++                        //partitionStats.incrFinishedVertexCount();
+                     }
++        //**************************** SEREF-END ********************************//
+                     partitionStats.incrVertexCount();
+                     partitionStats.addEdgeCount(basicVertex.getNumOutEdges());
+                 }
++        //**************************** SEREF-START ********************************//
++                for (BasicVertex<I, V, E, M> basicVertex :
++                    partition.getVertices()) {
++                	//Log.info("Halt: "+basicVertex.isHalted()
++                    //		+"\tNeedsOperation "+basicVertex.needsOperation);
++                	if (basicVertex.isHalted() && !basicVertex.needsOperation) {
++                        partitionStats.incrFinishedVertexCount();
++                    }
++                }
++       //**************************** SEREF-END ********************************//
++
+                 partitionStatsList.add(partitionStats);
+             }
++            
+         } while (!serviceWorker.finishSuperstep(partitionStatsList));
+         if (LOG.isInfoEnabled()) {
+             LOG.info("map: BSP application done " +
+diff -rupN org2/apache/giraph/graph/partition/HashWorkerPartitioner.java org/apache/giraph/graph/partition/HashWorkerPartitioner.java
+--- org2/apache/giraph/graph/partition/HashWorkerPartitioner.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/partition/HashWorkerPartitioner.java	2013-07-25 02:29:24.575518000 -0400
+@@ -26,9 +26,14 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
++import org.apache.giraph.graph.BspServiceWorker;
++import org.apache.giraph.graph.BspUtils;
++import org.apache.giraph.graph.GiraphJob;
+ import org.apache.giraph.graph.WorkerInfo;
++import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
++import org.mortbay.log.Log;
+ 
+ /**
+  * Implements hash-based partitioning from the id hash code.
+@@ -51,8 +56,45 @@ public class HashWorkerPartitioner<I ext
+         return new BasicPartitionOwner();
+     }
+ 
++    //**************************** SEREF-START ********************************//
+     @Override
+-    public PartitionOwner getPartitionOwner(I vertexId) {
++    public PartitionOwner getMeshPartitionOwner(I vertexId, BspServiceWorker<I, V, E, M> serviceWorker) {
++    	
++    	
++    	String partitionerType = serviceWorker.getConfiguration().
++    			get(GiraphJob.PARTITIONER_TYPE, "mesh");
++
++    	int wcount = serviceWorker.getConfiguration().getInt(GiraphJob.MAX_WORKERS, -1);
++    	int vertex_count = serviceWorker.getConfiguration().getInt(GiraphJob.NUM_VERTICES, -1);
++    	int result = (int) (Math.floor( ((LongWritable)vertexId).get()
++    			/ (vertex_count / wcount)
++    			));
++
++
++    	
++    	if(partitionerType.equals("metis")){
++    		int vid = (int) ((LongWritable)(vertexId)).get();
++    		int metisPartition;
++    		synchronized(BspUtils.metisMap){
++    			metisPartition = BspUtils.getFromMetisMap(vid);
++    			if(metisPartition==-1){
++    				throw new IllegalStateException(
++                            "SEREF getMeshPartitionOwner: Vertex " + vid +
++                            " has an invalid owner worker!");
++    			}
++    		}
++        	int metisResult = (int) (Math.floor( metisPartition % (wcount)	));
++        	if(vid==3)
++        	Log.info("ID: "+vid +"\tmetisPartition: " + metisPartition
++        			+"\tmetisResult: " + metisResult);
++    		return partitionOwnerList.get(metisResult);
++    	}
++    	return	partitionOwnerList.get(result);
++    }
++    //**************************** SEREF-END ********************************//
++
++    @Override
++    public PartitionOwner getPartitionOwner(I vertexId) {    	
+         return partitionOwnerList.get(Math.abs(vertexId.hashCode())
+                 % partitionOwnerList.size());
+     }
+diff -rupN org2/apache/giraph/graph/partition/PartitionUtils.java org/apache/giraph/graph/partition/PartitionUtils.java
+--- org2/apache/giraph/graph/partition/PartitionUtils.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/partition/PartitionUtils.java	2013-07-25 02:29:24.637918000 -0400
+@@ -39,6 +39,7 @@ import com.google.common.collect.Maps;
+ public class PartitionUtils {
+     /** Class logger */
+     private static Logger LOG = Logger.getLogger(PartitionUtils.class);
++    public static int workerCount;
+ 
+     private static class EdgeCountComparator implements
+             Comparator<Entry<WorkerInfo, VertexEdgeCount>> {
+diff -rupN org2/apache/giraph/graph/partition/WorkerGraphPartitioner.java org/apache/giraph/graph/partition/WorkerGraphPartitioner.java
+--- org2/apache/giraph/graph/partition/WorkerGraphPartitioner.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/partition/WorkerGraphPartitioner.java	2013-07-25 02:29:24.731518000 -0400
+@@ -21,6 +21,7 @@ package org.apache.giraph.graph.partitio
+ import java.util.Collection;
+ import java.util.Map;
+ 
++import org.apache.giraph.graph.BspServiceWorker;
+ import org.apache.giraph.graph.WorkerInfo;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+@@ -87,4 +88,11 @@ public interface WorkerGraphPartitioner<
+      * @return Collection of owners for every partition.
+      */
+     Collection<? extends PartitionOwner> getPartitionOwners();
++
++	/**
++	 * @param workerInfo 
++	 * @param vertexId
++	 * @return
++	 */
++	PartitionOwner getMeshPartitionOwner(I vertexId, BspServiceWorker<I, V, E, M> serviceWorker);
+ }
+diff -rupN org2/apache/giraph/graph/WorkerContext.java org/apache/giraph/graph/WorkerContext.java
+--- org2/apache/giraph/graph/WorkerContext.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/WorkerContext.java	2013-09-17 11:14:53.825494674 -0400
+@@ -18,6 +18,11 @@
+ 
+ package org.apache.giraph.graph;
+ 
++import java.util.HashMap;
++import java.util.Map;
++
++import org.apache.hadoop.io.IntWritable;
++import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.mapreduce.Mapper;
+ 
+@@ -29,6 +34,17 @@ import org.apache.hadoop.mapreduce.Mappe
+ public abstract class WorkerContext implements AggregatorUsage {
+     /** Global graph state */
+ 	private GraphState graphState;
++	
++	public static long prDifferenceSum;
++
++	public static long updatedVertexCount;
++	public static long operatedVertexCount;
++	public static long needCountVertexCount;
++	public static int maxDegree;
++	public static boolean token;
++	
++	public Map<LongWritable, IntWritable> metisMap 
++		= new HashMap<LongWritable, IntWritable>();
+ 
+ 	public void setGraphState(GraphState graphState) {
+ 		this.graphState = graphState;
+diff -rupN org2/apache/giraph/graph/WorkerInfo.java org/apache/giraph/graph/WorkerInfo.java
+--- org2/apache/giraph/graph/WorkerInfo.java	2013-07-25 02:29:05.000000000 -0400
++++ org/apache/giraph/graph/WorkerInfo.java	2013-07-25 02:29:25.823520000 -0400
+@@ -28,6 +28,7 @@ import org.apache.hadoop.io.Writable;
+  * Information about a worker that is sent to the master and other workers.
+  */
+ public class WorkerInfo implements Writable {
++	private int workerID;
+     /** Worker hostname */
+     private String hostname;
+     /** Partition id of this worker */
+@@ -43,11 +44,12 @@ public class WorkerInfo implements Writa
+     public WorkerInfo() {
+     }
+ 
+-    public WorkerInfo(String hostname, int partitionId, int port) {
++    public WorkerInfo(String hostname, int partitionId, int port, int workerID) {
+         this.hostname = hostname;
+         this.partitionId = partitionId;
+         this.port = port;
+         this.hostnameId = hostname + "_" + partitionId;
++        this.workerID = workerID;
+     }
+ 
+     public String getHostname() {
+@@ -108,4 +110,18 @@ public class WorkerInfo implements Writa
+         output.writeInt(partitionId);
+         output.writeInt(port);
+     }
++
++	/**
++	 * @return the workerID
++	 */
++	public int getWorkerID() {
++		return workerID;
++	}
++
++	/**
++	 * @param workerID the workerID to set
++	 */
++	public void setWorkerID(int workerID) {
++		this.workerID = workerID;
++	}
+ }
